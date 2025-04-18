@@ -1,155 +1,152 @@
-import os
 import random
 import string
-import asyncio
 import zipfile
-from io import BytesIO
-from telethon import TelegramClient
-from telethon.tl.functions.messages import SendMessageRequest
+import os
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ParseMode
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InputFile
+from aiogram.utils import executor
+from telethon.sync import TelegramClient
+from telethon.errors import SessionPasswordNeededError, PhoneNumberBannedError
+import time
 
-# Ваши настройки API
-api_id = 26160389  # Ваш api_id
-api_hash = '88f5d04e3d1c3c295ab7cb89ead79f89'  # Ваш api_hash
+API_TOKEN = '7504133005:AAH-knGjlCFi1EZrpjDWrRR_q8kAaiMftVw'
 
-# Файл для хранения токенов
-TOKEN_FILE = "tokens.txt"
-
-# Вводим ваш токен для бота
-bot_token = "ВАШ_ТОКЕН_ДЛЯ_Бота"
-
-# Создаем объект бота и диспетчера для Aiogram
-bot = Bot(token=bot_token)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
 
-# Профиль
-profile_data = {"valid_sessions": 0, "invalid_sessions": 0}
+user_data = {}
 
-# Генерация случайного юзернейма для бота
-def generate_username():
-    letters = string.ascii_lowercase
-    digits = string.digits
-    username = ''.join(random.choice(letters + digits) for i in range(3)) + ''.join(random.choice(digits) for i in range(3)) + '_bot'
-    return username
+main_menu = ReplyKeyboardMarkup(resize_keyboard=True)
+main_menu.add(
+    KeyboardButton("🔐 Генерация токена по сессии"),
+    KeyboardButton("📊 Мой профиль"),
+    KeyboardButton("🧪 Проверка сессий")
+)
 
-# Функция для создания бота через BotFather
-async def create_bot():
-    client = TelegramClient('anon', api_id, api_hash)
-    await client.start()
+@dp.message_handler(commands=['start'])
+async def start_handler(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_data:
+        user_data[user_id] = {"tokens": 0, "valid": 0, "invalid": 0}
+    await message.answer(f"👋 Привет, {message.from_user.first_name}!\nВыбери действие ниже:", reply_markup=main_menu)
 
-    # Получаем все чаты
-    dialogs = await client.get_dialogs()
+@dp.message_handler(lambda msg: msg.text == "📊 Мой профиль")
+async def profile_handler(message: types.Message):
+    data = user_data.get(message.from_user.id, {"tokens": 0, "valid": 0, "invalid": 0})
+    await message.answer(
+        f"📊 Твоя статистика:\n"
+        f"Сгенерировано токенов: {data['tokens']}\n"
+        f"Валидных сессий: {data['valid']}\n"
+        f"Невалидных сессий: {data['invalid']}"
+    )
 
-    # Ищем BotFather
-    bot_father = None
-    for dialog in dialogs:
-        if dialog.name == "BotFather":
-            bot_father = dialog.entity
-            break
+@dp.message_handler(lambda msg: msg.text == "🔐 Генерация токена по сессии")
+async def ask_for_session(message: types.Message):
+    await message.answer("📩 Пришли .session или .json файл сессии")
 
-    if not bot_father:
-        return None
+@dp.message_handler(lambda msg: msg.text == "🧪 Проверка сессий")
+async def ask_zip_file(message: types.Message):
+    await message.answer("📦 Пришли архив .zip с сессиями (.session/.json)")
 
-    # Отправляем команду на создание бота
-    username = generate_username()
-    await client.send_message(bot_father, f"/newbot")
-    response = await client.get_response(bot_father)
-    if "Отлично! Теперь придумайте имя" in response.text:
-        await client.send_message(bot_father, "Test Bot Name")
-        response = await client.get_response(bot_father)
+@dp.message_handler(content_types=types.ContentType.DOCUMENT)
+async def handle_docs(message: types.Message):
+    user_id = message.from_user.id
+    doc = message.document
+    file_path = f"downloads/{user_id}_{doc.file_name}"
 
-    if "Теперь отправь мне юзернейм для бота" in response.text:
-        await client.send_message(bot_father, username)
-        response = await client.get_response(bot_father)
+    os.makedirs("downloads", exist_ok=True)
+    await doc.download(destination_file=file_path)
 
-    # Вытаскиваем токен бота
-    token = response.text.split(' ')[-1]
-    await client.disconnect()
+    if doc.file_name.endswith(".zip"):
+        valid, invalid = 0, 0
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            extract_path = f"downloads/extracted_{user_id}"
+            zip_ref.extractall(extract_path)
+            
+            valid_dir = os.path.join(extract_path, "valid")
+            invalid_dir = os.path.join(extract_path, "invalid")
+            os.makedirs(valid_dir, exist_ok=True)
+            os.makedirs(invalid_dir, exist_ok=True)
 
-    return token
+            for file in os.listdir(extract_path):
+                if file.endswith(".session") or file.endswith(".json"):
+                    full_path = os.path.join(extract_path, file)
+                    try:
+                        client = TelegramClient(full_path.replace('.session', ''), 26160389, '88f5d04e3d1c3c295ab7cb89ead79f89')
+                        client.connect()
+                        if not client.is_user_authorized():
+                            raise Exception("not authorized")
+                        valid += 1
+                        os.rename(full_path, os.path.join(valid_dir, file))
+                    except:
+                        invalid += 1
+                        os.rename(full_path, os.path.join(invalid_dir, file))
+                    finally:
+                        client.disconnect()
 
-# Функция для проверки сессий на валидность
-async def check_sessions():
-    valid_sessions = []
-    invalid_sessions = []
-    
-    # Список сессий
-    sessions = ["session1.session", "session2.session", "session3.session"]  # Пример, замените на ваши сессии
-    for session in sessions:
-        # Проверьте, валидная ли сессия (псевдокод, замените на свою логику)
-        if random.choice([True, False]):  # Симуляция проверки сессии
-            valid_sessions.append(session)
-        else:
-            invalid_sessions.append(session)
-    
-    return valid_sessions, invalid_sessions
+        zip_result = f"downloads/result_{user_id}.zip"
+        with zipfile.ZipFile(zip_result, 'w') as result_zip:
+            for folder in [valid_dir, invalid_dir]:
+                for file in os.listdir(folder):
+                    result_zip.write(os.path.join(folder, file), arcname=os.path.join(os.path.basename(folder), file))
 
-# Функция для создания архива с сессиями
-def create_zip(valid_sessions, invalid_sessions):
-    buffer = BytesIO()
-    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for session in valid_sessions:
-            zipf.writestr(session, "valid")  # Здесь ваши данные
-        for session in invalid_sessions:
-            zipf.writestr(session, "invalid")  # Здесь ваши данные
-    buffer.seek(0)
-    return buffer
+        user_data[user_id]["valid"] += valid
+        user_data[user_id]["invalid"] += invalid
 
-# Статистика профиля
-@dp.message_handler(commands=['profile'])
-async def profile(message: types.Message):
-    await message.answer(f"Профиль:\n\n"
-                         f"Валидных сессий: {profile_data['valid_sessions']}\n"
-                         f"Невалидных сессий: {profile_data['invalid_sessions']}")
+        await message.answer(f"✅ Проверка завершена!\nВалидных: {valid}\nНевалидных: {invalid}")
+        await message.answer_document(InputFile(zip_result))
 
-# Мои токены
-@dp.message_handler(commands=['tokens'])
-async def my_tokens(message: types.Message):
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as file:
-            tokens = file.readlines()
-        if tokens:
-            await message.answer("Ваши токены:\n\n" + "\n".join(tokens))
-        else:
-            await message.answer("У вас нет токенов.")
-    else:
-        await message.answer("У вас нет токенов.")
+    elif doc.file_name.endswith(".session") or doc.file_name.endswith(".json"):
+        try:
+            session_path = file_path.replace(".json", "")
+            client = TelegramClient(session_path, 26160389, '88f5d04e3d1c3c295ab7cb89ead79f89')
+            client.connect()
+            if not client.is_user_authorized():
+                raise Exception("not authorized")
+            me = client.get_me()
 
-# Проверка сессий
-@dp.message_handler(commands=['check_sessions'])
-async def check_session(message: types.Message):
-    valid_sessions, invalid_sessions = await check_sessions()
+            # Создание имени и username
+            bot_name = "Bot" + ''.join(random.choices(string.ascii_letters, k=5))
+            bot_username = ''.join(random.choices(string.ascii_lowercase, k=3)) + ''.join(random.choices(string.digits, k=3)) + "_bot"
 
-    # Обновляем статистику
-    profile_data['valid_sessions'] += len(valid_sessions)
-    profile_data['invalid_sessions'] += len(invalid_sessions)
+            # Начинаем создание бота через BotFather
+            botfather = await client.get_entity('@BotFather')
+            await client.send_message(botfather, '/newbot')
+            time.sleep(1)
 
-    await message.answer(f"Проверка сессий завершена.\n\n"
-                         f"Валидных сессий: {len(valid_sessions)}\n"
-                         f"Невалидных сессий: {len(invalid_sessions)}")
+            # Отправка названия бота
+            await client.send_message(botfather, bot_name)
+            time.sleep(1)
 
-    # Создаем архив с результатами
-    zip_buffer = create_zip(valid_sessions, invalid_sessions)
+            # Отправка юзернейма для бота
+            await client.send_message(botfather, bot_username)
+            time.sleep(1)
 
-    # Отправляем архив
-    await message.answer_document(document=zip_buffer, filename="sessions.zip")
+            # Получаем токен для нового бота (после создания)
+            messages = await client.get_messages(botfather, limit=5)
+            bot_token = None
+            for message in messages:
+                if 'Use this token' in message.text:
+                    bot_token = message.text.split('Use this token')[1].strip()
+                    break
 
-# Команда на создание нового бота
-@dp.message_handler(commands=['create_bot'])
-async def create_new_bot(message: types.Message):
-    token = await create_bot()
-    if token:
-        # Сохраняем токен в файл
-        with open(TOKEN_FILE, "a") as file:
-            file.write(f"{token}\n")
-        await message.answer(f"Новый бот создан! Токен: {token}")
-    else:
-        await message.answer("Ошибка при создании бота.")
+            if bot_token:
+                await message.answer(
+                    f"✅ Нам удалось создать бота!\n\n"
+                    f"👤 Аккаунт: +{me.phone}\n"
+                    f"🤖 Токен: {bot_token}"
+                )
 
-# Запуск бота
+                user_data[user_id]["tokens"] += 1
+            else:
+                await message.answer("❌ Не удалось получить токен.")
+            
+            client.disconnect()
+
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {str(e)}")
+
 if __name__ == '__main__':
-    from aiogram import executor
-    executor.start_polling(dp)
+    print("Бот запущен...")
+    executor.start_polling(dp, skip_updates=True)
